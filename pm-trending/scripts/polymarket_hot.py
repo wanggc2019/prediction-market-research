@@ -4,12 +4,12 @@
 数据来源：Polymarket 公开的 Gamma API（只读，无需登录、无需钱包）。
 
 用法：
-    python3 polymarket_hot.py                 # 默认：按 24h 成交量取前 100 个事件，排除体育/电竞
-    python3 polymarket_hot.py --limit 200     # 采集更多事件
-    python3 polymarket_hot.py --include-sports
-    python3 polymarket_hot.py --top 30        # 报告中展示前 30 个事件
+    python3 scripts/polymarket_hot.py                 # 默认：按 24h 成交量取前 100 个事件，排除体育/电竞
+    python3 scripts/polymarket_hot.py --limit 200     # 采集更多事件
+    python3 scripts/polymarket_hot.py --include-sports
+    python3 scripts/polymarket_hot.py --top 30        # 报告中展示前 30 个事件
 
-输出：
+输出（相对模块目录 pm-trending/）：
     data/snapshots/<时间戳>.json.gz   完整快照（保留以便日后做时间序列）
     data/snapshots/<时间戳>.csv.gz    每个子市场一行，方便用 pandas 分析
     reports/latest.md              可读的中文报告
@@ -30,7 +30,7 @@ from pathlib import Path
 
 API = "https://gamma-api.polymarket.com/events"
 EVENT_URL = "https://polymarket.com/event/"
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent  # 模块目录 pm-trending/
 
 SPORTS_TAGS = {"Sports", "Esports", "Games"}
 # 这些标签不代表话题，汇总话题热度时忽略

@@ -1,26 +1,29 @@
 # prediction-market-research
 
-## polymarket_hot.py — Polymarket 热点与市场预期
+个人预测市场研究仓库。**一个仓库 = 若干自包含需求模块**，每个需求一个子目录（`pm-<需求>`），
+模块之间不互相 import。
 
-从 Polymarket 公开的 Gamma API（只读，不需要账号）抓取当前 24h 成交额最高的事件，生成：
+## 模块
 
-- `reports/latest.md`：话题热度排行、热门事件及各选项概率、24h 预期变化最大的市场
-- `data/snapshots/<时间戳>.json.gz|csv.gz`：完整快照，多次运行后可做时间序列分析
+| 目录 | 需求 | 运行时 | 说明 |
+|---|---|---|---|
+| [`pm-trending/`](pm-trending/README.md) | Polymarket 热点事件采集 → 话题热度 / 市场预期 / 预期变化报告 + 快照 | Python 3（标准库） | 2026-11-19 从仓库根迁入；Gamma API 只读、零 key，launchd 每小时 |
 
-```bash
-python3 polymarket_hot.py                  # 默认抓 100 个事件，排除体育/电竞
-python3 polymarket_hot.py --limit 200 --top 30
-python3 polymarket_hot.py --include-sports
+## 结构
+
+```
+prediction-market-research/
+├── README.md / Makefile
+├── tools/launchd.sh          # 按模块模板渲染/安装 launchd 任务
+└── pm-<需求>/                 # 自包含模块
+    ├── README.md
+    ├── scripts/              # 代码；collect.sh 为定时入口
+    ├── deploy/launchd/       # agent.plist.tmpl
+    └── data/ reports/ logs/  # 运行产物（.gitignore）
 ```
 
-只用 Python 标准库，无需安装依赖。概率取自盘口中间价，仅代表市场定价。
-
-快照以 gzip 压缩保存（每次约 50 KB），`pd.read_csv("data/snapshots/xxx.csv.gz")` 可以直接读取。
-
-### 定时采集（macOS）
+launchd Label 统一为 `com.prediction-market-research.<模块名>`：
 
 ```bash
-bash scripts/install_schedule.sh              # 每小时运行一次（launchd），日志在 logs/
-INTERVAL=14400 bash scripts/install_schedule.sh  # 改成每 4 小时一次
-bash scripts/install_schedule.sh --uninstall  # 卸载
+make launchd module=<模块> action=install|uninstall|status [interval=秒]
 ```
