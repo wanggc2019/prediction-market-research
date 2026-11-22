@@ -27,3 +27,8 @@ launchd Label 统一为 `com.prediction-market-research.<模块名>`：
 ```bash
 make launchd module=<模块> action=install|uninstall|status [interval=秒]
 ```
+
+## Git 钩子
+
+gitleaks 和 AI 代码审查用的是本机全局 git 钩子（`~/dotfiles`，`core.hooksPath=~/.config/git/hooks`），本仓库不单独配置。
+本仓库不要设置 `core.hooksPath`，否则全局钩子不生效。

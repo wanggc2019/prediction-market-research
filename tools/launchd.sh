@@ -6,38 +6,44 @@
 set -euo pipefail
 
 MODULE="${1:?用法：tools/launchd.sh <模块> install|uninstall|status}"
+MODULE="${MODULE%/}"   # 容忍补全带的尾部斜杠
+[[ "${MODULE}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "模块名不合法：${MODULE}"; exit 2; }
 ACTION="${2:-status}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-MODULE_DIR="$REPO/${MODULE}"
-TMPL="$MODULE_DIR/deploy/launchd/agent.plist.tmpl"
+MODULE_DIR="${REPO}/${MODULE}"
+TMPL="${MODULE_DIR}/deploy/launchd/agent.plist.tmpl"
 LABEL="com.prediction-market-research.${MODULE}"
-PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 DOMAIN="gui/$(id -u)"
 INTERVAL="${INTERVAL:-3600}"
+[[ "${INTERVAL}" =~ ^[1-9][0-9]*$ ]] || { echo "interval 必须是正整数秒：${INTERVAL}"; exit 2; }
 
 [[ -f "${TMPL}" ]] || { echo "找不到模板：${TMPL}"; exit 2; }
 
 case "${ACTION}" in
   install)
     PY_DIR="$(dirname "$(command -v python3)")"
-    mkdir -p "$MODULE_DIR/logs" "$(dirname "$PLIST")"
-    sed -e "s|__LABEL__|${LABEL}|g" -e "s|__MODULE_DIR__|$MODULE_DIR|g" \
-        -e "s|__LOG_DIR__|$MODULE_DIR/logs|g" -e "s|__INTERVAL__|$INTERVAL|g" \
-        -e "s|__PATH__|$PY_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
-        "${TMPL}" > "$PLIST"
-    plutil -lint "$PLIST" >/dev/null
-    launchctl bootout "$DOMAIN/${LABEL}" 2>/dev/null || true
-    launchctl bootstrap "$DOMAIN" "$PLIST"
+    mkdir -p "${MODULE_DIR}/logs" "$(dirname "${PLIST}")"
+    sed -e "s|__LABEL__|${LABEL}|g" -e "s|__MODULE_DIR__|${MODULE_DIR}|g" \
+        -e "s|__LOG_DIR__|${MODULE_DIR}/logs|g" -e "s|__INTERVAL__|${INTERVAL}|g" \
+        -e "s|__PATH__|${PY_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
+        "${TMPL}" > "${PLIST}"
+    plutil -lint "${PLIST}" >/dev/null
+    launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+    launchctl bootstrap "${DOMAIN}" "${PLIST}"
     echo "已安装 ${LABEL}：每 ${INTERVAL}s 运行一次，日志在 ${MODULE}/logs/"
     ;;
   uninstall)
-    launchctl bootout "$DOMAIN/${LABEL}" 2>/dev/null || true
-    rm -f "$PLIST"
+    launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+    rm -f "${PLIST}"
     echo "已卸载 ${LABEL}"
     ;;
   status)
-    launchctl print "$DOMAIN/${LABEL}" 2>/dev/null | grep -E "^\s*(state|runs|last exit code|run interval)" \
-      || echo "${LABEL} 未安装"
+    if out="$(launchctl print "${DOMAIN}/${LABEL}" 2>/dev/null)"; then
+      printf '%s\n' "${out}" | grep -E '^[[:space:]]*(state|runs|last exit code|run interval) ' || true
+    else
+      echo "${LABEL} 未安装"
+    fi
     ;;
   *) echo "未知 action：${ACTION}（install|uninstall|status）"; exit 2 ;;
 esac
