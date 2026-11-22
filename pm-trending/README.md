@@ -12,7 +12,11 @@ python3 scripts/polymarket_hot.py                  # 默认抓 100 个事件，�
 python3 scripts/polymarket_hot.py --limit 200 --top 30
 python3 scripts/polymarket_hot.py --include-sports
 ./scripts/collect.sh                               # launchd 入口（同上，带 start/done 日志）
+python3 -m unittest discover -s tests              # 离线单测
 ```
+
+抓取失败会按 2s / 5s / 15s 退避重试（网络错误、超时、429/5xx）；第一页仍失败则本轮退出（rc≠0），
+后续页失败则保留已抓到的事件，报告顶部标注「不完整」。翻页时排名漂移导致的重复事件按 `id` 去重。
 
 `--limit` 是排除体育前的抓取数，排除后实际事件数会少一些。概率取自盘口中间价（价差 > 0.1 时取最新报价），仅代表市场定价。
 
@@ -32,6 +36,13 @@ make launchd module=pm-trending action=uninstall
 | 路径 | 内容 |
 |---|---|
 | `reports/latest.md` | 中文报告：话题热度排行、热门事件、24h 预期变化最大的市场 |
-| `data/snapshots/<UTC 时间戳>.json.gz` | 完整快照（事件摘要，约 50 KB/次） |
-| `data/snapshots/<UTC 时间戳>.csv.gz` | 每个子市场一行，`pd.read_csv(...)` 可直接读 |
+| `data/raw/<UTC 时间戳>.json.gz` | Gamma API 原始响应（与报告同口径的事件，保留全部字段；去掉已关闭市场、图片和结算规则长文本），约 300 KB/次 |
+| `data/catalog/descriptions.jsonl` | 每个事件/市场的结算规则文本，首次见到时追加一次（按 `kind` + `id` 去重） |
+| `data/snapshots/<UTC 时间戳>.json.gz` | 事件摘要快照，约 50 KB/次 |
+| `data/snapshots/<UTC 时间戳>.csv.gz` | 每个子市场一行，`pd.read_csv(...)` 可直接读；跨快照用 `market_id` 对齐 |
 | `logs/launchd.out.log` / `launchd.err.log` | 定时任务日志 |
+
+时间戳 2026-11-22 起为 `YYYYMMDD-HHMMSS`（之前为 `YYYYMMDD-HHMM`，同一分钟内两次运行会互相覆盖）。
+CSV 列 `schema`：2026-11-22 起为 2，在末尾追加了 `market_id`、`condition_id`、`market_slug`、`best_bid`、`best_ask`、
+`last_trade`、`market_liquidity`、`neg_risk`；更早的快照没有这些列（schema 1），按列名读取即可兼容。
+

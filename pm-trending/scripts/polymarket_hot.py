@@ -9,9 +9,11 @@
     python3 scripts/polymarket_hot.py --include-sports
     python3 scripts/polymarket_hot.py --top 30        # 报告中展示前 30 个事件
 
-输出（相对模块目录 pm-trending/）：
-    data/snapshots/<时间戳>.json.gz   完整快照（保留以便日后做时间序列）
-    data/snapshots/<时间戳>.csv.gz    每个子市场一行，方便用 pandas 分析
+输出（相对模块目录 pm-trending/，时间戳为 UTC YYYYMMDD-HHMMSS）：
+    data/raw/<时间戳>.json.gz        Gamma API 原始响应（与报告同口径的事件；去掉已关闭市场、图片和结算规则长文本）
+    data/catalog/descriptions.jsonl  每个市场的结算规则文本，首次见到时追加一次
+    data/snapshots/<时间戳>.json.gz   事件摘要快照
+    data/snapshots/<时间戳>.csv.gz    每个子市场一行（market_id 可跨快照对齐），方便用 pandas 分析
     reports/latest.md              可读的中文报告
 """
 
@@ -21,7 +23,10 @@ import argparse
 import csv
 import gzip
 import json
+import socket
+import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -38,8 +43,38 @@ NOISE_TAGS = {"Hide From New", "Recurring", "Games", "All", "Featured", "Yearly"
               "Weekly", "Daily", "Main Election", "Hit Price", "Tweet Markets"}
 
 
-def fetch_events(limit: int, page_size: int = 50) -> list[dict]:  # API 拒绝 limit>50（返回 406）
+CSV_SCHEMA = 2  # 1：2026-11-22 之前（无市场级 ID）；2：追加 market_id 等列
+RETRY_BACKOFF = (2, 5, 15)  # 失败后依次等待的秒数（共 4 次尝试）
+
+
+def get_json(url: str, timeout: float = 30):
+    """GET 并解析 JSON；网络错误、超时、429/5xx、响应截断时退避重试，其它 4xx 直接抛出。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "pm-research/0.1"})
+    for attempt in range(len(RETRY_BACKOFF) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and e.code < 500:
+                raise
+            err: Exception = e
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, ValueError) as e:
+            err = e   # ValueError 覆盖 JSONDecodeError 和 chunked 读取中断导致的不完整 JSON
+        if attempt == len(RETRY_BACKOFF):
+            raise err
+        wait = RETRY_BACKOFF[attempt]
+        print(f"[warn] 请求失败（{type(err).__name__}: {err}），{wait}s 后第 {attempt + 2} 次尝试", file=sys.stderr)
+        time.sleep(wait)
+
+
+def fetch_events(limit: int, page_size: int = 50) -> tuple[list[dict], bool]:  # API 拒绝 limit>50（返回 406）
+    """按 24h 成交额倒序翻页抓取，按事件 id 去重。
+
+    翻页期间排名会变，同一事件可能出现在相邻两页（实测出现过），所以去重并继续翻到够数。
+    返回 (原始事件列表, 是否完整)：第一页失败直接抛出；后续页失败保留已抓到的部分，标记不完整。
+    """
     events: list[dict] = []
+    seen: set = set()
     offset = 0
     while len(events) < limit:
         params = {
@@ -47,16 +82,29 @@ def fetch_events(limit: int, page_size: int = 50) -> list[dict]:  # API 拒绝 l
             "order": "volume24hr", "ascending": "false",
             "limit": min(page_size, limit - len(events)), "offset": offset,
         }
-        url = f"{API}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "pm-research/0.1"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            batch = json.load(resp)
+        try:
+            batch = get_json(f"{API}?{urllib.parse.urlencode(params)}")
+        except Exception as e:
+            if not events:
+                raise
+            print(f"[warn] offset={offset} 抓取失败（{e}），保留已抓到的 {len(events)} 个事件", file=sys.stderr)
+            return events, False
         if not batch:
             break
-        events.extend(batch)
+        for e in batch:
+            if e.get("id") not in seen:
+                seen.add(e.get("id"))
+                events.append(e)
         offset += len(batch)
         time.sleep(0.3)  # 对公开 API 客气一点
-    return events
+    return events[:limit], True
+
+
+def _float(v) -> float | None:
+    try:
+        return None if v is None or v == "" else float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _json_list(value) -> list:
@@ -70,8 +118,8 @@ def _json_list(value) -> list:
 
 def yes_probability(m: dict) -> float | None:
     """优先用买卖中间价，盘口太宽时退回到 outcomePrices。"""
-    bid, ask = m.get("bestBid"), m.get("bestAsk")
-    if bid is not None and ask is not None and 0 < ask - bid <= 0.1:
+    bid, ask = _float(m.get("bestBid")), _float(m.get("bestAsk"))
+    if bid is not None and ask is not None and ask > 0 and 0 <= ask - bid <= 0.1:
         return (bid + ask) / 2
     prices = _json_list(m.get("outcomePrices"))
     outcomes = _json_list(m.get("outcomes"))
@@ -102,6 +150,14 @@ def summarize_event(e: dict) -> dict:
             "volume24hr": float(m.get("volume24hr") or 0),
             "volume": float(m.get("volumeNum") or m.get("volume") or 0),
             "outcome_labels": _json_list(m.get("outcomes")),
+            "market_id": m.get("id"),
+            "condition_id": m.get("conditionId"),
+            "market_slug": m.get("slug"),
+            "best_bid": _float(m.get("bestBid")),
+            "best_ask": _float(m.get("bestAsk")),
+            "last_trade": _float(m.get("lastTradePrice")),
+            "liquidity": _float(m.get("liquidityNum") or m.get("liquidity")),
+            "neg_risk": bool(m.get("negRisk")),
         })
     outcomes.sort(key=lambda o: o["prob"], reverse=True)
     return {
@@ -120,6 +176,10 @@ def summarize_event(e: dict) -> dict:
 
 def is_sports(ev: dict) -> bool:
     return bool(SPORTS_TAGS & set(ev["tags"]))
+
+
+def is_sports_raw(e: dict) -> bool:
+    return bool(SPORTS_TAGS & {t.get("label") for t in e.get("tags") or []})
 
 
 def topic_ranking(events: list[dict]) -> list[tuple[str, float, int]]:
@@ -170,7 +230,7 @@ def md_cell(s: str) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ")
 
 
-def write_report(events: list[dict], ts: str, top: int, sports_excluded: bool) -> Path:
+def write_report(events: list[dict], ts: str, top: int, sports_excluded: bool, complete: bool = True) -> Path:
     lines = [
         "# Polymarket 热点与市场预期",
         "",
@@ -179,6 +239,10 @@ def write_report(events: list[dict], ts: str, top: int, sports_excluded: bool) -
         "",
         "> 概率取自买卖中间价（盘口过宽时取最新报价），只代表市场定价，不是事实，也不是投资建议。",
         "",
+    ]
+    if not complete:
+        lines += ["> ⚠️ 本次抓取中途失败，只包含部分事件，排名和话题热度可能偏低。", ""]
+    lines += [
         "## 话题热度（按 24h 成交额汇总标签）",
         "",
         "| 排名 | 话题标签 | 24h 成交额 | 事件数 |",
@@ -207,6 +271,62 @@ def write_report(events: list[dict], ts: str, top: int, sports_excluded: bool) -
     return out
 
 
+# 原始快照里去掉的字段：图片 URL 无分析价值；description（结算规则）不随时间变化，单独存进 catalog
+RAW_DROP = {"description", "image", "icon", "twitterCardImage", "featuredImage"}
+
+
+def _strip(d: dict) -> dict:
+    return {k: v for k, v in d.items() if k not in RAW_DROP}
+
+
+def compact_raw(raw: list[dict]) -> list[dict]:
+    """保留全部 API 字段，只去掉 RAW_DROP 和已关闭/非活跃市场（单场体育赛事可挂 400+ 个已结束子盘口）。"""
+    return [{**_strip(e), "markets": [_strip(m) for m in e.get("markets") or []
+                                      if not m.get("closed") and m.get("active", True)]}
+            for e in raw]
+
+
+def write_raw(raw: list[dict], stamp: str, fetched_at: str, limit: int, complete: bool,
+              sports_excluded: bool) -> Path:
+    raw_dir = ROOT / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    path = raw_dir / f"{stamp}.json.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump({"fetched_at": fetched_at, "source": API, "order": "volume24hr", "limit": limit,
+                   "complete": complete, "sports_excluded": sports_excluded,
+                   "dropped_fields": sorted(RAW_DROP), "events": compact_raw(raw)}, f, ensure_ascii=False)
+    return path
+
+
+def update_catalog(raw: list[dict], fetched_at: str) -> int:
+    """把没见过的事件/市场的结算规则文本追加到 data/catalog/descriptions.jsonl，返回新增条数。"""
+    path = ROOT / "data" / "catalog" / "descriptions.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    seen: set = set()
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    seen.add((r["kind"], r["id"]))
+                except (ValueError, KeyError):
+                    continue
+    new = []
+    for e in raw:
+        items = [("event", e)] + [("market", m) for m in e.get("markets") or []
+                                  if not m.get("closed") and m.get("active", True)]
+        for kind, x in items:
+            if x.get("id") and x.get("description") and (kind, x["id"]) not in seen:
+                seen.add((kind, x["id"]))
+                new.append({"kind": kind, "id": x["id"], "event_id": e.get("id"),
+                            "condition_id": x.get("conditionId"), "title": x.get("question") or x.get("title"),
+                            "description": x["description"], "first_seen": fetched_at})
+    if new:
+        with path.open("a", encoding="utf-8") as f:
+            f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in new)
+    return len(new)
+
+
 def write_snapshot(events: list[dict], stamp: str) -> tuple[Path, Path]:
     snap_dir = ROOT / "data" / "snapshots"
     snap_dir.mkdir(parents=True, exist_ok=True)
@@ -220,13 +340,19 @@ def write_snapshot(events: list[dict], stamp: str) -> tuple[Path, Path]:
         w = csv.writer(f)
         w.writerow(["snapshot", "event_id", "event_title", "tags", "event_volume24hr",
                     "event_volume", "end_date", "outcome", "prob", "change_1d",
-                    "change_1w", "market_volume24hr", "url"])
+                    "change_1w", "market_volume24hr", "url",
+                    # schema 2 新增（追加在末尾，旧快照按列名读取不受影响）
+                    "schema", "market_id", "condition_id", "market_slug", "best_bid", "best_ask",
+                    "last_trade", "market_liquidity", "neg_risk"])
         for ev in events:
             for o in ev["outcomes"]:
                 w.writerow([stamp, ev["id"], ev["title"], ";".join(ev["tags"]),
                             round(ev["volume24hr"], 2), round(ev["volume"], 2), ev["end_date"],
                             o["name"], round(o["prob"], 4), o["change_1d"], o["change_1w"],
-                            round(o["volume24hr"], 2), ev["url"]])
+                            round(o["volume24hr"], 2), ev["url"],
+                            CSV_SCHEMA, o["market_id"], o["condition_id"], o["market_slug"],
+                            o["best_bid"], o["best_ask"], o["last_trade"], o["liquidity"],
+                            int(o["neg_risk"])])
     return jpath, cpath
 
 
@@ -248,18 +374,24 @@ def main() -> None:
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
-    raw = fetch_events(args.limit)
-    events = [summarize_event(e) for e in raw]
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    fetched_at = now.isoformat(timespec="seconds")
+    raw, complete = fetch_events(args.limit)
     if not args.include_sports:
-        events = [ev for ev in events if not is_sports(ev)]
+        raw = [e for e in raw if not is_sports_raw(e)]
+    rpath = write_raw(raw, stamp, fetched_at, args.limit, complete, not args.include_sports)
+    n_new = update_catalog(raw, fetched_at)
+    events = [summarize_event(e) for e in raw]
     events.sort(key=lambda ev: ev["volume24hr"], reverse=True)
 
-    stamp = now.strftime("%Y%m%d-%H%M")
     jpath, cpath = write_snapshot(events, stamp)
-    report = write_report(events, now.strftime("%Y-%m-%d %H:%M"), args.top, not args.include_sports)
+    report = write_report(events, now.strftime("%Y-%m-%d %H:%M"), args.top, not args.include_sports, complete)
 
     print_summary(events)
-    print(f"\n已保存：\n  {report.relative_to(ROOT)}\n  {jpath.relative_to(ROOT)}\n  {cpath.relative_to(ROOT)}")
+    print("\n已保存：" + "".join(f"\n  {p.relative_to(ROOT)}" for p in (report, rpath, jpath, cpath))
+          + f"\n  data/catalog/descriptions.jsonl（新增 {n_new} 条结算规则）")
+    if not complete:
+        print("[warn] 本次抓取不完整，见上方警告", file=sys.stderr)
 
 
 if __name__ == "__main__":
